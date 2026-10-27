@@ -1088,9 +1088,9 @@ function arkaic_sync_get_latest_github_release( $force = false ) {
 	return false;
 }
 
-// Filtre WordPress : vérifie la présence d'une nouvelle version
-add_filter( 'pre_set_site_transient_update_plugins', function ( $transient ) {
-	if ( empty( $transient->checked ) ) {
+// Filtre WordPress : injecte la mise à jour directement dans l'onglet Extensions (plugins.php)
+function arkaic_sync_inject_update( $transient ) {
+	if ( ! is_object( $transient ) ) {
 		return $transient;
 	}
 
@@ -1131,11 +1131,40 @@ add_filter( 'pre_set_site_transient_update_plugins', function ( $transient ) {
 
 	if ( version_compare( $remote_version, $current_version, '>' ) ) {
 		$transient->response[ $plugin_file ] = $item;
+		if ( isset( $transient->no_update[ $plugin_file ] ) ) {
+			unset( $transient->no_update[ $plugin_file ] );
+		}
 	} else {
 		$transient->no_update[ $plugin_file ] = $item;
+		if ( isset( $transient->response[ $plugin_file ] ) ) {
+			unset( $transient->response[ $plugin_file ] );
+		}
 	}
 
 	return $transient;
+}
+add_filter( 'pre_set_site_transient_update_plugins', 'arkaic_sync_inject_update' );
+add_filter( 'site_transient_update_plugins', 'arkaic_sync_inject_update' );
+
+// Liens d'action directs sur la ligne du plugin dans Extensions (plugins.php)
+add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), function ( $links ) {
+	$check_url = wp_nonce_url( admin_url( 'plugins.php?arkaic_sync_check_now=1' ), 'arkaic_sync_check_nonce' );
+	$custom    = array(
+		'settings' => '<a href="' . esc_url( admin_url( 'options-general.php?page=arkaic-sync' ) ) . '">Réglages</a>',
+		'check'    => '<a href="' . esc_url( $check_url ) . '" title="Vérifier immédiatement les mises à jour sur GitHub">Vérifier les MAJ</a>',
+	);
+	return array_merge( $custom, $links );
+} );
+
+// Déclencheur du lien "Vérifier les MAJ" depuis l'onglet Extensions
+add_action( 'admin_init', function () {
+	if ( isset( $_GET['arkaic_sync_check_now'] ) && check_admin_referer( 'arkaic_sync_check_nonce' ) ) {
+		delete_site_transient( 'arkaic_sync_gh_release' );
+		delete_site_transient( 'update_plugins' );
+		set_transient( 'arkaic_sync_notice_' . get_current_user_id(), array( 'info', 'Recherche des mises à jour Arkaic Sync effectuée.' ), 30 );
+		wp_safe_redirect( admin_url( 'plugins.php' ) );
+		exit;
+	}
 } );
 
 // Filtre WordPress : informations détaillées de la mise à jour (modal "Afficher les détails")
