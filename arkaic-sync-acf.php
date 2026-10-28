@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Arkaic Sync ACF
  * Description: Pousse les articles cochés (champs ACF, images, catégories) vers un autre site WordPress.
- * Version: 0.6.0
+ * Version: 0.7.0
  *
  * À installer sur la source ET sur la cible, puis configurer dans Réglages > Arkaic Sync.
  * L'authentification utilise un jeton partagé (en-tête X-Arkaic-Token), pas l'en-tête Authorization
@@ -14,7 +14,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-const ARKAIC_SYNC_VERSION     = '0.6.0';
+const ARKAIC_SYNC_VERSION     = '0.7.0';
 const ARKAIC_SYNC_GITHUB_REPO = 'arkaicconcept/arkaic-sync-acf';
 const ARKAIC_SYNC_META        = '_arkaic_sync_enabled';
 const ARKAIC_SYNC_EXCLUDED    = array( '_edit_lock', '_edit_last', '_thumbnail_id', '_wp_old_slug', '_wp_old_date', '_encloseme', '_pingme' );
@@ -431,6 +431,8 @@ add_filter( 'handle_bulk_actions-edit-post', function ( $redirect_to, $doaction,
 		} else {
 			$errors++;
 		}
+		// Temporisation de 300ms entre chaque article pour préserver le pool de connexions MySQL (IONOS mutualisé)
+		usleep( 300000 );
 	}
 	return add_query_arg( array(
 		'arkaic_bulk_synced' => $synced,
@@ -459,7 +461,7 @@ add_action( 'admin_footer-edit.php', function () {
 		$(document).on('click', '.arkaic-sync-btn', function(e) {
 			e.preventDefault();
 			var $btn = $(this);
-			if ($btn.hasClass('updating-message') || $btn.prop('disabled')) {
+			if ($btn.hasClass('updating-message') || $btn.prop('disabled') || $('.arkaic-sync-btn.updating-message').length > 0) {
 				return;
 			}
 			var postId = $btn.data('id');
@@ -467,12 +469,14 @@ add_action( 'admin_footer-edit.php', function () {
 			var oldHtml = $btn.html();
 
 			$btn.addClass('updating-message').prop('disabled', true).text('Synchro...');
+			$('.arkaic-sync-btn').not($btn).css('opacity', '0.5').css('pointer-events', 'none');
 
 			$.post(ajaxurl, {
 				action: 'arkaic_sync_ajax',
 				post_id: postId,
 				nonce: nonce
 			}).done(function(res) {
+				$('.arkaic-sync-btn').css('opacity', '').css('pointer-events', '');
 				if (res && res.data && res.data.html) {
 					var $cell = $('#arkaic-sync-cell-' + postId);
 					if ($cell.length) {
@@ -486,6 +490,7 @@ add_action( 'admin_footer-edit.php', function () {
 					$btn.removeClass('updating-message').prop('disabled', false).html(oldHtml);
 				}
 			}).fail(function(xhr) {
+				$('.arkaic-sync-btn').css('opacity', '').css('pointer-events', '');
 				alert('Erreur réseau (' + xhr.status + ')');
 				$btn.removeClass('updating-message').prop('disabled', false).html(oldHtml);
 			});
@@ -573,6 +578,7 @@ function arkaic_sync_media( $attachment_id ) {
 			'filename' => $filename,
 			'title'    => $title,
 			'alt'      => $alt,
+			'hash'     => $hash,
 		) );
 	}
 
@@ -582,6 +588,7 @@ function arkaic_sync_media( $attachment_id ) {
 			'filename' => $filename,
 			'title'    => $title,
 			'alt'      => $alt,
+			'hash'     => $hash,
 		) );
 		$media = arkaic_sync_request( 'POST', '/media?' . $query, array(
 			'headers' => array( 'Content-Type' => 'application/octet-stream' ),
@@ -907,12 +914,57 @@ function arkaic_sync_receive_media( WP_REST_Request $request ) {
 	$filename = sanitize_file_name( (string) $request->get_param( 'filename' ) );
 	$title    = sanitize_text_field( (string) $request->get_param( 'title' ) );
 	$alt      = sanitize_text_field( (string) $request->get_param( 'alt' ) );
+	$hash     = sanitize_text_field( (string) $request->get_param( 'hash' ) );
 
 	if ( ! $filename && ! $url ) {
 		return new WP_Error( 'arkaic_sync_payload', 'URL ou nom de fichier manquant.', array( 'status' => 400 ) );
 	}
 	if ( ! $filename ) {
 		$filename = sanitize_file_name( basename( parse_url( $url, PHP_URL_PATH ) ) );
+	}
+
+	// 1. Détection par empreinte (hash MD5) : évite tout téléchargement ou doublon si l'image existe déjà sur la cible
+	if ( $hash ) {
+		$existing = get_posts( array(
+			'post_type'      => 'attachment',
+			'post_status'    => 'inherit',
+			'posts_per_page' => 1,
+			'meta_key'       => '_arkaic_sync_hash',
+			'meta_value'     => $hash,
+			'fields'         => 'ids',
+		) );
+
+		if ( ! empty( $existing ) ) {
+			$existing_id   = (int) $existing[0];
+			$existing_file = get_attached_file( $existing_id );
+			if ( $existing_file && file_exists( $existing_file ) ) {
+				if ( $alt && ! get_post_meta( $existing_id, '_wp_attachment_image_alt', true ) ) {
+					update_post_meta( $existing_id, '_wp_attachment_image_alt', $alt );
+				}
+				return array( 'id' => $existing_id, 'url' => wp_get_attachment_url( $existing_id ) );
+			}
+		}
+
+		// Rétroactivité : si le hash n'est pas encore en meta, chercher les médias existants ayant le même nom de fichier
+		if ( $filename ) {
+			global $wpdb;
+			$like          = '%' . $wpdb->esc_like( $filename );
+			$candidate_ids = $wpdb->get_col( $wpdb->prepare(
+				"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_wp_attached_file' AND meta_value LIKE %s LIMIT 5",
+				$like
+			) );
+			foreach ( $candidate_ids as $cand_id ) {
+				$cand_id   = (int) $cand_id;
+				$file_path = get_attached_file( $cand_id );
+				if ( $file_path && file_exists( $file_path ) && md5_file( $file_path ) === $hash ) {
+					update_post_meta( $cand_id, '_arkaic_sync_hash', $hash );
+					if ( $alt && ! get_post_meta( $cand_id, '_wp_attachment_image_alt', true ) ) {
+						update_post_meta( $cand_id, '_wp_attachment_image_alt', $alt );
+					}
+					return array( 'id' => $cand_id, 'url' => wp_get_attachment_url( $cand_id ) );
+				}
+			}
+		}
 	}
 
 	if ( $url ) {
@@ -949,6 +1001,15 @@ function arkaic_sync_receive_media( WP_REST_Request $request ) {
 		}
 
 		wp_update_attachment_metadata( $id, wp_generate_attachment_metadata( $id, $upload['file'] ) );
+	}
+
+	if ( $hash ) {
+		update_post_meta( $id, '_arkaic_sync_hash', $hash );
+	} else {
+		$new_file = get_attached_file( $id );
+		if ( $new_file && file_exists( $new_file ) ) {
+			update_post_meta( $id, '_arkaic_sync_hash', md5_file( $new_file ) );
+		}
 	}
 
 	if ( $alt ) {
