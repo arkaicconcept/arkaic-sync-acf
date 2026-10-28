@@ -24,6 +24,11 @@ jobs:
 
       - name: Upload zip to Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" arkaic-sync-acf.zip --clobber
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.ref_name }}"
+          fi
+          gh release upload "$TAG" arkaic-sync-acf.zip --clobber -R "${{ github.repository }}"
